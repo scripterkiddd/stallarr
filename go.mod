@@ -2,7 +2,7 @@ module stallarr
 
 go 1.18
 
-replace golift.io/starr v0.14.0 => ../starr
+replace golift.io/starr v0.14.0 => github.com/scripterkiddd/starr master
 
 require (
 	github.com/gdm85/go-libdeluge v0.5.6

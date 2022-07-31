@@ -8,6 +8,8 @@ This connects to deluge and looks for torrents that are:
 
 If all the above is true, then the torrent is stalled and will be blocklisted in sonarr or radarr.
 
+docker pull scripterkiddd/stallarr:latest
+
 Settings (.env or env variables)
 ```text
 DELUGE_HOST=localhost
@@ -28,6 +30,7 @@ PRETEND=true           # for testing
 DEBUG=true             # debug logging
 REFRESH_DURATION=10m   # how often to check for new stalled torrents
 STALL_DURATION=1h      # how long after the torrent was added to wait before killing it
+RUN_ON_STARTUP=true    # run on startup or wait REFRESH_DURATION before running
 ```
 
 Deluge username and password can be obtained from config/auth 

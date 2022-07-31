@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  stallarr:
+    image: scripterkiddd/stallarr:latest
+    environment:
+      DELUGE_HOST: localhost
+      DELUGE_USERNAME: deluge
+      DELUGE_PASSWORD: deluge
+      SONARR_ENABLED: true
+      SONARR_API_KEY: api_key
+      SONARR_URL: http://localhost:8989
+      RADARR_ENABLED: true
+      RADARR_API_KEY: api_key
+      RADARR_URL: http://localhost:7878
+      ONLY_LABELS: tv,movies
