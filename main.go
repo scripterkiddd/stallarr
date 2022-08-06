@@ -129,7 +129,7 @@ func (s *Service) Setup() error {
 		radarrConfig := starr.New(s.config.RadarrAPIKey, s.config.RadarrURL, 0)
 		s.radarr = radarr.New(radarrConfig)
 		s.log.Debug().Msgf("Testing radarr connection")
-		_, err := s.sonarr.GetQueue(1, 1)
+		_, err := s.radarr.GetQueue(1, 1)
 		return err
 	})
 	return wg.Wait()
@@ -196,6 +196,7 @@ func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 			if IsLikeTitle(record.Title, v.Name) {
 				episodesToSearch = append(episodesToSearch, record.EpisodeID)
 				s.log.Info().Msgf("%d", record.EpisodeID)
+
 				deleteErr := s.DoSonarrDelete(record, v)
 				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
