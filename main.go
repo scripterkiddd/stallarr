@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
+
 	"golift.io/starr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
@@ -45,13 +46,15 @@ type Config struct {
 	DelugeUsername string `env:"DELUGE_USERNAME" default:"nobody"`
 	DelugePassword string `env:"DELUGE_PASSWORD" default:"deluge"`
 
-	EnableSonarr bool   `env:"SONARR_ENABLED"`
-	SonarrAPIKey string `env:"SONARR_API_KEY"`
-	SonarrURL    string `env:"SONARR_URL" default:"http://localhost:8989"`
+	EnableSonarr         bool   `env:"SONARR_ENABLED"`
+	SonarrAPIKey         string `env:"SONARR_API_KEY"`
+	SonarrURL            string `env:"SONARR_URL" default:"http://localhost:8989"`
+	SonarrSearchOnDelete bool   `env:"SONARR_SEARCH_ON_DELETE" default:"true"`
 
-	EnableRadarr bool   `env:"RADARR_ENABLED"`
-	RadarrAPIKey string `env:"RADARR_API_KEY" default:"deluge"`
-	RadarrURL    string `env:"RADARR_URL"  default:"http://localhost:7878"`
+	EnableRadarr         bool   `env:"RADARR_ENABLED"`
+	RadarrAPIKey         string `env:"RADARR_API_KEY" default:"deluge"`
+	RadarrURL            string `env:"RADARR_URL"  default:"http://localhost:7878"`
+	RadarrSearchOnDelete bool   `env:"RADARR_SEARCH_ON_DELETE" default:"true"`
 
 	OnlyLabels      []string      `env:"ONLY_LABELS" sep:","`
 	RefreshDuration time.Duration `env:"REFRESH_DURATION" default:"10m" type:"time.Duration"`
@@ -187,14 +190,22 @@ func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 	if err != nil {
 		return nil, err
 	}
+	episodesToSearch := []int64{}
 	for _, record := range q.Records {
 		for k, v := range stalled {
 			if IsLikeTitle(record.Title, v.Name) {
+				episodesToSearch = append(episodesToSearch, record.EpisodeID)
+				s.log.Info().Msgf("%d", record.EpisodeID)
 				deleteErr := s.DoSonarrDelete(record, v)
 				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
 				}
 			}
+		}
+	}
+	if s.config.SonarrSearchOnDelete && len(episodesToSearch) > 0 {
+		if searchErr := s.AttemptSonarrSearch(episodesToSearch); searchErr != nil {
+			s.log.Err(searchErr).Msgf("failed to search sonarr")
 		}
 	}
 	s.log.Debug().Msgf("Done Sonarr processing")
@@ -204,6 +215,19 @@ func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 
 func IsLikeTitle(recordName, torrentName string) bool {
 	return recordName == torrentName || strings.HasPrefix(torrentName, recordName)
+}
+
+func (s *Service) AttemptSonarrSearch(episodes []int64) error {
+	if s.config.Pretend {
+		s.log.Info().Msgf("PRETEND: search command sent")
+		return nil
+	}
+	resp, err := s.sonarr.SendCommandContext(s.ctx, &sonarr.CommandRequest{
+		Name:       sonarr.EpisodeSearch,
+		EpisodeIDs: episodes,
+	})
+	s.log.Info().Msgf("started search for epID %+v and got %s", episodes, resp.Status)
+	return err
 }
 
 func (s *Service) DoSonarrDelete(record *sonarr.QueueRecord, torrent *delugeclient.TorrentStatus) error {
@@ -231,9 +255,11 @@ func (s *Service) RadarrDelete(stalled Torrents) (Torrents, error) {
 	if err != nil {
 		return nil, err
 	}
+	idsToSearch := []int64{}
 	for _, record := range q.Records {
 		for k, v := range stalled {
 			if IsLikeTitle(record.Title, v.Name) {
+				idsToSearch = append(idsToSearch, record.MovieID)
 				deleteErr := s.DoRadarrDelete(record, v)
 				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
@@ -241,8 +267,26 @@ func (s *Service) RadarrDelete(stalled Torrents) (Torrents, error) {
 			}
 		}
 	}
+	if s.config.RadarrSearchOnDelete && len(idsToSearch) > 0 {
+		if searchErr := s.AttemptRadarrSearch(idsToSearch); searchErr != nil {
+			s.log.Err(searchErr).Msgf("failed to search radarr")
+		}
+	}
 	s.log.Debug().Msgf("Done Radarr processing")
 	return stalled, nil
+}
+
+func (s *Service) AttemptRadarrSearch(ids []int64) error {
+	if s.config.Pretend {
+		s.log.Info().Msgf("PRETEND: search command sent")
+		return nil
+	}
+	resp, err := s.radarr.SendCommandContext(s.ctx, &radarr.CommandRequest{
+		Name:     radarr.MoviesSearch,
+		MovieIDs: ids,
+	})
+	s.log.Info().Msgf("started search for epID %+v and got %s", ids, resp.Status)
+	return err
 }
 
 func (s *Service) DoRadarrDelete(record *radarr.QueueRecord, torrent *delugeclient.TorrentStatus) error {
