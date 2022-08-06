@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -79,18 +80,22 @@ func New() (*Service, func() error) {
 	}
 
 	s := &Service{
-		log:    zerolog.New(os.Stdout),
+		log: zerolog.New(os.Stdout).With().
+			Timestamp().
+			Logger(),
 		config: config,
 		ctx:    context.Background(),
 	}
-
+	if err := s.Setup(); err != nil {
+		s.log.Fatal().Err(err).Msg("setup failed")
+	}
 	return s, func() error {
 		s.ctx.Done()
 		return s.deluge.Close()
 	}
 }
 
-func (s *Service) Setup() {
+func (s *Service) Setup() error {
 	wg := &errgroup.Group{}
 	wg.Go(func() error {
 		timeout := time.Minute * DelugeTimeout
@@ -124,9 +129,7 @@ func (s *Service) Setup() {
 		_, err := s.sonarr.GetQueue(1, 1)
 		return err
 	})
-	if err := wg.Wait(); err != nil {
-		log.Fatal().Err(err).Msgf("error starting up")
-	}
+	return wg.Wait()
 }
 
 func (s *Service) Run() chan struct{} {
@@ -153,7 +156,6 @@ func (s *Service) Process() {
 	s.log.Debug().Msgf("Starting process")
 	if err := s.deluge.Connect(); err != nil {
 		s.log.Debug().Msgf("Failed to connect to deluge %s", err.Error())
-		s.log.Fatal().Err(err)
 		return
 	}
 	allStalled, err := s.GetStalledTorrents()
@@ -162,8 +164,8 @@ func (s *Service) Process() {
 		s.log.Fatal().Err(err)
 		return
 	}
-	for k := range allStalled {
-		s.log.Debug().Msgf("Target stalled torrent %s", k)
+	for _, v := range allStalled {
+		s.log.Debug().Msgf("Target stalled torrent %s", v.Name)
 	}
 	var processErr error
 	allStalled, processErr = s.SonarrDelete(allStalled)
@@ -187,7 +189,7 @@ func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 	}
 	for _, record := range q.Records {
 		for k, v := range stalled {
-			if record.Title == v.Name {
+			if IsLikeTitle(record.Title, v.Name) {
 				deleteErr := s.DoSonarrDelete(record, v)
 				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
@@ -198,6 +200,10 @@ func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 	s.log.Debug().Msgf("Done Sonarr processing")
 
 	return stalled, nil
+}
+
+func IsLikeTitle(recordName, torrentName string) bool {
+	return recordName == torrentName || strings.HasPrefix(torrentName, recordName)
 }
 
 func (s *Service) DoSonarrDelete(record *sonarr.QueueRecord, torrent *delugeclient.TorrentStatus) error {
@@ -227,7 +233,7 @@ func (s *Service) RadarrDelete(stalled Torrents) (Torrents, error) {
 	}
 	for _, record := range q.Records {
 		for k, v := range stalled {
-			if record.Title == v.Name {
+			if IsLikeTitle(record.Title, v.Name) {
 				deleteErr := s.DoRadarrDelete(record, v)
 				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
