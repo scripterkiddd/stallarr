@@ -2,29 +2,29 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"os"
+	"time"
+
 	"github.com/alecthomas/kong"
 	delugeclient "github.com/gdm85/go-libdeluge"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/errgroup"
 	"golift.io/starr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
-	"os"
-	"time"
 )
 
 func main() {
 	s, cleanup := New()
 	defer func() {
 		if err := cleanup(); err != nil {
-			fmt.Printf("Error in cleanup %s \n", err.Error())
+			log.Printf("Error in cleanup %s \n", err.Error())
 		}
 	}()
 	s.log.Info().Msg("Init")
 
-	//done := make(chan bool)
 	done := s.Run()
 	<-done
 }
@@ -35,6 +35,7 @@ type Service struct {
 	sonarr *sonarr.Sonarr
 	radarr *radarr.Radarr
 	config Config
+	ctx    context.Context
 }
 
 type Config struct {
@@ -60,6 +61,10 @@ type Config struct {
 	Debug        bool `env:"DEBUG" default:"false"`
 }
 
+type Torrents map[string]*delugeclient.TorrentStatus
+
+const DelugeTimeout = 2
+
 func New() (*Service, func() error) {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
@@ -72,26 +77,56 @@ func New() (*Service, func() error) {
 	if config.Debug {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
-	deluge := delugeclient.NewV2(delugeclient.Settings{
-		Hostname:         config.DelugeHost,
-		Port:             config.DelugePort,
-		Login:            config.DelugeUsername,
-		ReadWriteTimeout: time.Minute * 2,
-		Password:         config.DelugePassword,
+
+	s := &Service{
+		log:    zerolog.New(os.Stdout),
+		config: config,
+		ctx:    context.Background(),
+	}
+
+	return s, func() error {
+		s.ctx.Done()
+		return s.deluge.Close()
+	}
+}
+
+func (s *Service) Setup() {
+	wg := &errgroup.Group{}
+	wg.Go(func() error {
+		timeout := time.Minute * DelugeTimeout
+		deluge := delugeclient.NewV2(delugeclient.Settings{
+			Hostname:         s.config.DelugeHost,
+			Port:             s.config.DelugePort,
+			Login:            s.config.DelugeUsername,
+			ReadWriteTimeout: timeout,
+			Password:         s.config.DelugePassword,
+		})
+		s.deluge = deluge.Client
+		return deluge.Connect()
 	})
-
-	sonarrConfig := starr.New(config.SonarrAPIKey, config.SonarrURL, 0)
-	radarrConfig := starr.New(config.RadarrAPIKey, config.RadarrURL, 0)
-
-	return &Service{
-			log:    zerolog.New(os.Stdout),
-			deluge: deluge.Client,
-			sonarr: sonarr.New(sonarrConfig),
-			radarr: radarr.New(radarrConfig),
-			config: config,
-		}, func() error {
-			return deluge.Close()
+	wg.Go(func() error {
+		if !s.config.EnableSonarr {
+			return nil
 		}
+		sonarrConfig := starr.New(s.config.SonarrAPIKey, s.config.SonarrURL, 0)
+		s.sonarr = sonarr.New(sonarrConfig)
+		s.log.Debug().Msgf("Testing sonarr connection")
+		_, err := s.sonarr.GetQueue(1, 1)
+		return err
+	})
+	wg.Go(func() error {
+		if !s.config.EnableRadarr {
+			return nil
+		}
+		radarrConfig := starr.New(s.config.RadarrAPIKey, s.config.RadarrURL, 0)
+		s.radarr = radarr.New(radarrConfig)
+		s.log.Debug().Msgf("Testing radarr connection")
+		_, err := s.sonarr.GetQueue(1, 1)
+		return err
+	})
+	if err := wg.Wait(); err != nil {
+		log.Fatal().Err(err).Msgf("error starting up")
+	}
 }
 
 func (s *Service) Run() chan struct{} {
@@ -117,11 +152,15 @@ func (s *Service) Run() chan struct{} {
 func (s *Service) Process() {
 	s.log.Debug().Msgf("Starting process")
 	if err := s.deluge.Connect(); err != nil {
+		s.log.Debug().Msgf("Failed to connect to deluge %s", err.Error())
 		s.log.Fatal().Err(err)
+		return
 	}
 	allStalled, err := s.GetStalledTorrents()
 	if err != nil {
+		s.log.Debug().Msgf("Failed to gather torrents %s", err.Error())
 		s.log.Fatal().Err(err)
+		return
 	}
 	for k := range allStalled {
 		s.log.Debug().Msgf("Target stalled torrent %s", k)
@@ -137,7 +176,7 @@ func (s *Service) Process() {
 	}
 }
 
-func (s *Service) SonarrDelete(stalled map[string]*delugeclient.TorrentStatus) (map[string]*delugeclient.TorrentStatus, error) {
+func (s *Service) SonarrDelete(stalled Torrents) (Torrents, error) {
 	if !s.config.EnableSonarr {
 		return stalled, nil
 	}
@@ -149,14 +188,8 @@ func (s *Service) SonarrDelete(stalled map[string]*delugeclient.TorrentStatus) (
 	for _, record := range q.Records {
 		for k, v := range stalled {
 			if record.Title == v.Name {
-				if s.config.Pretend {
-					s.log.Info().Msgf("PRETEND: Will delete %s from sonarr", v.Name)
-					continue
-				}
-				if err := s.sonarr.DeleteQueueRecord(context.Background(), record, &sonarr.DeleteQueueRecordParam{Blacklist: true}); err != nil {
-					s.log.Err(err).Msgf("failed to remove %s from sonarr", v.Name)
-				} else {
-					s.log.Debug().Msgf("Successfully blocked %s in sonarr", k)
+				deleteErr := s.DoSonarrDelete(record, v)
+				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
 				}
 			}
@@ -167,7 +200,23 @@ func (s *Service) SonarrDelete(stalled map[string]*delugeclient.TorrentStatus) (
 	return stalled, nil
 }
 
-func (s *Service) RadarrDelete(stalled map[string]*delugeclient.TorrentStatus) (map[string]*delugeclient.TorrentStatus, error) {
+func (s *Service) DoSonarrDelete(record *sonarr.QueueRecord, torrent *delugeclient.TorrentStatus) error {
+	if s.config.Pretend {
+		s.log.Info().Msgf("PRETEND: Will delete %s from sonarr", torrent.Name)
+		return nil
+	}
+	if err := s.sonarr.DeleteQueueRecord(
+		s.ctx,
+		record,
+		&sonarr.DeleteQueueRecordParam{Blacklist: true}); err != nil {
+		s.log.Err(err).Msgf("failed to remove %s from sonarr", torrent.Name)
+		return err
+	}
+	s.log.Debug().Msgf("Successfully blocked %s in sonarr", torrent.Name)
+	return nil
+}
+
+func (s *Service) RadarrDelete(stalled Torrents) (Torrents, error) {
 	if !s.config.EnableRadarr {
 		return stalled, nil
 	}
@@ -179,42 +228,49 @@ func (s *Service) RadarrDelete(stalled map[string]*delugeclient.TorrentStatus) (
 	for _, record := range q.Records {
 		for k, v := range stalled {
 			if record.Title == v.Name {
-				if s.config.Pretend {
-					s.log.Info().Msgf("PRETEND: Will delete %s from radarr", v.Name)
-					continue
-				}
-				if err := s.radarr.DeleteQueueRecord(context.Background(), record, &radarr.DeleteQueueRecordParam{
-					Blocklist:        true,
-					RemoveFromClient: true,
-				}); err != nil {
-					s.log.Err(err).Msgf("failed to remove %s from radarr", v.Name)
-				} else {
-					s.log.Debug().Msgf("Successfully blocked %s in radarr", k)
+				deleteErr := s.DoRadarrDelete(record, v)
+				if deleteErr == nil {
 					delete(stalled, k) // on success remove it from the kill list
 				}
 			}
 		}
 	}
 	s.log.Debug().Msgf("Done Radarr processing")
-
 	return stalled, nil
 }
 
-func (s *Service) FilterTorrentsForStalled(downloading map[string]*delugeclient.TorrentStatus) map[string]*delugeclient.TorrentStatus {
+func (s *Service) DoRadarrDelete(record *radarr.QueueRecord, torrent *delugeclient.TorrentStatus) error {
+	if s.config.Pretend {
+		s.log.Info().Msgf("PRETEND: Will delete %s from radarr", torrent.Name)
+		return nil
+	}
+	if err := s.radarr.DeleteQueueRecord(s.ctx, record, &radarr.DeleteQueueRecordParam{
+		Blocklist:        true,
+		RemoveFromClient: true,
+	}); err != nil {
+		s.log.Err(err).Msgf("failed to remove %s from radarr", torrent.Name)
+		return err
+	}
+	s.log.Debug().Msgf("Successfully blocked %s in radarr", torrent.Name)
+
+	return nil
+}
+
+func (s *Service) FilterTorrentsForStalled(downloading Torrents) Torrents {
 	now := time.Now()
 	res := map[string]*delugeclient.TorrentStatus{}
 	for k, v := range downloading {
 		cutoff := time.Unix(int64(v.TimeAdded), 0).Add(s.config.StallDuration)
 		if v.ETA == 0 && v.TotalDone == 0 && v.CompletedTime == 0 && now.After(cutoff) {
 			res[k] = v
-			s.log.Debug().Msgf("Found stalled torrent %s", k)
+			s.log.Debug().Msgf("Found stalled torrent %s", v.Name)
 		}
 	}
 
 	return res
 }
 
-func (s *Service) FilterForLabel(downloading map[string]*delugeclient.TorrentStatus) (map[string]*delugeclient.TorrentStatus, error) {
+func (s *Service) FilterForLabel(downloading Torrents) (Torrents, error) {
 	if len(s.config.OnlyLabels) == 0 {
 		return downloading, nil
 	}
@@ -224,9 +280,9 @@ func (s *Service) FilterForLabel(downloading map[string]*delugeclient.TorrentSta
 		return nil, err
 	}
 	for k, v := range downloading {
-		torLabel, err := label.GetTorrentLabel(k)
-		if err != nil {
-			return nil, err
+		torLabel, labelErr := label.GetTorrentLabel(k)
+		if labelErr != nil {
+			return nil, labelErr
 		}
 		if Contains(torLabel, s.config.OnlyLabels) {
 			res[k] = v
@@ -236,7 +292,7 @@ func (s *Service) FilterForLabel(downloading map[string]*delugeclient.TorrentSta
 	return res, nil
 }
 
-func (s *Service) GetStalledTorrents() (map[string]*delugeclient.TorrentStatus, error) {
+func (s *Service) GetStalledTorrents() (Torrents, error) {
 	session, err := s.deluge.SessionState()
 	if err != nil {
 		return nil, err
